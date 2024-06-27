@@ -7,6 +7,7 @@ extern "C" {
 #endif
 
 #include "py/obj.h"
+#include "mpfile/mpfile.h"
 
 #include "t3amoled_qspi_bus.h"
 
@@ -96,6 +97,7 @@ typedef struct _rm67162_RM67162_obj_t {
     mp_obj_base_t *bus_obj;
     rm67162_panel_p_t *lcd_panel_p;
     mp_obj_t reset;
+	mp_file_t *fp;              //File object
     bool reset_level;
     uint8_t color_space;
 	

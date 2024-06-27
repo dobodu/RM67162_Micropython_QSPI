@@ -10,6 +10,9 @@
 #include "esp_lcd_panel_io.h"
 #include "driver/spi_master.h"
 
+#include "mpfile/mpfile.h"
+#include "jpg/tjpgd565.h"
+
 #include <string.h>
 #include <math.h>
 
@@ -335,7 +338,6 @@ STATIC mp_obj_t rm67162_RM67162_send_cmd(size_t n_args, const mp_obj_t *args_in)
     return mp_const_none;
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(rm67162_RM67162_send_cmd_obj, 4, 4, rm67162_RM67162_send_cmd);
-
 
 /*-----------------------------------------------------------------------------------------------------
 Below are drawing functions.
@@ -1516,6 +1518,313 @@ STATIC mp_obj_t rm67162_RM67162_write(size_t n_args, const mp_obj_t *args) {
 STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(rm67162_RM67162_write_obj, 5, 9, rm67162_RM67162_write);
 
 
+/*----------------------------------------------------------------------------------------------------
+Below are JPG related functions.
+-----------------------------------------------------------------------------------------------------*/
+
+// User defined device identifier
+typedef struct {
+    mp_file_t *fp;              // File pointer for input function
+    uint8_t *fbuf;              // Pointer to the frame buffer for output function
+    unsigned int wfbuf;         // Width of the frame buffer [pix]
+    unsigned int left;          // jpg crop left column
+    unsigned int top;           // jpg crop top row
+    unsigned int right;         // jpg crop right column
+    unsigned int bottom;        // jpg crop bottom row
+    rm67162_RM67162_obj_t *self;  // display object
+    // for buffer input function
+    uint8_t *data;
+    unsigned int dataIdx;
+    unsigned int dataLen;
+} IODEV;
+
+static unsigned int buffer_in_func(     // Returns number of bytes read (zero on error)
+    JDEC *jd,                           // Decompression object
+    uint8_t *buff,                      // Pointer to the read buffer (null to remove data)
+    unsigned int nbyte) {               // Number of bytes to read/remove
+    IODEV *dev = (IODEV *)jd->device;
+
+    if (dev->dataIdx + nbyte > dev->dataLen) {
+        nbyte = dev->dataLen - dev->dataIdx;
+    }
+
+    if (buff) {
+        memcpy(buff, (uint8_t *)(dev->data + dev->dataIdx), nbyte);
+    }
+
+    dev->dataIdx += nbyte;
+    return nbyte;
+}
+
+//
+// file input function
+//
+
+static unsigned int file_in_func(       // Returns number of bytes read (zero on error)
+    JDEC *jd,                           // Decompression object
+    uint8_t *buff,                      // Pointer to the read buffer (null to remove data)
+    unsigned int nbyte) {               // Number of bytes to read/remove
+    IODEV *dev = (IODEV *)jd->device;   // Device identifier for the session (5th argument of jd_prepare function)
+    unsigned int nread;
+
+    // Read data from input stream
+    if (buff) {
+        nread = (unsigned int)mp_readinto(dev->fp, buff, nbyte);
+        return nread;
+    }
+
+    // Remove data from input stream if buff was NULL
+    mp_seek(dev->fp, nbyte, SEEK_CUR);
+    return 0;
+}
+
+//
+// fast output function
+//
+
+static int out_fast(                    // 1:Ok, 0:Aborted
+    JDEC *jd,                           // Decompression object
+    void *bitmap,                       // Bitmap data to be output
+    JRECT *rect) {                      // Rectangular region of output image
+    IODEV *dev = (IODEV *)jd->device;
+    uint8_t *src, *dst;
+    uint16_t y, bws, bwd;
+
+    // Copy the decompressed RGB rectangular to the frame buffer (assuming RGB565)
+    src = (uint8_t *)bitmap;
+    dst = dev->fbuf + 2 * (rect->top * dev->wfbuf + rect->left);    // Left-top of destination rectangular assuming 16bpp = 2 bytes
+    bws = 2 * (rect->right - rect->left + 1);                       // Width of source rectangular [byte]
+    bwd = 2 * dev->wfbuf;                                           // Width of frame buffer [byte]
+    for (y = rect->top; y <= rect->bottom; y++) {
+        memcpy(dst, src, bws);                                      // Copy a line
+        src += bws;
+        dst += bwd;                                                 // Next line
+    }
+
+    return 1;     // Continue to decompress
+}
+
+
+//
+// Draw jpg from a file at x, y
+//
+
+static mp_obj_t rm67162_RM67162_jpg(size_t n_args, const mp_obj_t *args) {
+    rm67162_RM67162_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    static unsigned int (*input_func)(JDEC *, uint8_t *, unsigned int) = NULL;
+    mp_buffer_info_t bufinfo;
+    IODEV devid;
+
+    if (mp_obj_is_type(args[1], &mp_type_bytes)) {
+        mp_get_buffer_raise(args[1], &bufinfo, MP_BUFFER_READ);
+        devid.dataIdx = 0;
+        devid.data = bufinfo.buf;
+        devid.dataLen = bufinfo.len;
+        input_func = buffer_in_func;
+        self->fp = MP_OBJ_NULL;
+    } else {
+        const char *filename = mp_obj_str_get_str(args[1]);
+        self->fp = mp_open(filename, "rb");
+        devid.fp = self->fp;
+        input_func = file_in_func;
+        devid.data = MP_OBJ_NULL;
+        devid.dataLen = 0;
+    }
+
+    mp_int_t x = mp_obj_get_int(args[2]);
+    mp_int_t y = mp_obj_get_int(args[3]);
+	
+    int (*outfunc)(JDEC *, void *, JRECT *);    //Might be simplifyed (not out_slow function)
+
+    JRESULT res;                                // Result code of TJpgDec API
+    JDEC jdec;                                  // Decompression object
+    self->work = (void *)m_malloc(3100);        // Pointer to the work area
+    size_t bufsize;
+
+    if (input_func && (devid.fp || devid.data)) {
+        // Prepare to decompress
+        res = jd_prepare(&jdec, input_func, self->work, 3100, &devid);
+        if (res == JDR_OK) {
+			// Initialize output device
+            bufsize = 2 * jdec.width * jdec.height;          //Assuming 16bpp = 2bytes
+            outfunc = out_fast;                              // Might be simplifyed (no out_slow)
+            if (self->frame_buffer_size && (bufsize > self->frame_buffer_size)) {
+                mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("buffer too small. %ld bytes required."), (long)bufsize);
+            }
+
+            if (self->frame_buffer_size == 0) {
+                self->frame_buffer = m_malloc(bufsize);
+            }
+
+            if (!self->frame_buffer) {
+                mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("out of memory"));
+            }
+
+            devid.fbuf = (uint8_t *)self->frame_buffer;
+            devid.wfbuf = jdec.width;
+            devid.self = self;
+            res = jd_decomp(&jdec, outfunc, 0);         // Start to decompress with 1/1 scaling + Simplification to be done
+            if (res == JDR_OK) {
+                set_area(self, x, y, x + jdec.width - 1, y + jdec.height - 1);
+				write_color(self, bufinfo.buf, bufsize);
+            } else {
+                mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("jpg decompress failed."));
+            }
+            if (self->frame_buffer_size == 0) {
+                m_free(self->frame_buffer);           // Discard frame buffer
+                self->frame_buffer = MP_OBJ_NULL;
+            }
+            devid.fbuf = MP_OBJ_NULL;
+        } else {
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("jpg prepare failed."));
+        }
+
+        if (self->fp) {
+            mp_close(self->fp);
+            self->fp = MP_OBJ_NULL;
+        }
+    }
+    m_free(self->work);     // Discard work area
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(rm67162_RM67162_jpg_obj, 4, 5, rm67162_RM67162_jpg);
+
+//
+// output function for jpg_decode
+//
+
+static int out_crop(                    // 1:Ok, 0:Aborted
+    JDEC *jd,                           // Decompression object
+    void *bitmap,                       // Bitmap data to be output
+    JRECT *rect) {                      // Rectangular region of output image
+    IODEV *dev = (IODEV *)jd->device;
+
+    if (
+        dev->left <= rect->right &&
+        dev->right >= rect->left &&
+        dev->top <= rect->bottom &&
+        dev->bottom >= rect->top) {
+        uint16_t left = MAX(dev->left, rect->left);
+        uint16_t top = MAX(dev->top, rect->top);
+        uint16_t right = MIN(dev->right, rect->right);
+        uint16_t bottom = MIN(dev->bottom, rect->bottom);
+        uint16_t dev_width = dev->right - dev->left + 1;
+        uint16_t rect_width = rect->right - rect->left + 1;
+        uint16_t width = (right - left + 1) * 2;
+        uint16_t row;
+
+        for (row = top; row <= bottom; row++) {
+            memcpy(
+                (uint16_t *)dev->fbuf + ((row - dev->top) * dev_width) + left - dev->left,
+                (uint16_t *)bitmap + ((row - rect->top) * rect_width) + left - rect->left,
+                width);
+        }
+    }
+    return 1;     // Continue to decompress
+}
+
+//
+// Decode a jpg file and return it or a portion of it as a tuple containing
+// a blittable buffer, the width and height of the buffer.
+//
+
+static mp_obj_t rm67162_RM67162_jpg_decode(size_t n_args, const mp_obj_t *args) {
+    rm67162_RM67162_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+
+    static unsigned int (*input_func)(JDEC *, uint8_t *, unsigned int) = NULL;
+    mp_buffer_info_t bufinfo;
+    IODEV devid;
+
+    if (mp_obj_is_type(args[1], &mp_type_bytes)) {
+        mp_get_buffer_raise(args[1], &bufinfo, MP_BUFFER_READ);
+        devid.dataIdx = 0;
+        devid.data = bufinfo.buf;
+        devid.dataLen = bufinfo.len;
+        input_func = buffer_in_func;
+        self->fp = MP_OBJ_NULL;
+    } else {
+        const char *filename = mp_obj_str_get_str(args[1]);
+        self->fp = mp_open(filename, "rb");
+        devid.fp = self->fp;
+        input_func = file_in_func;
+        devid.data = MP_OBJ_NULL;
+        devid.dataLen = 0;
+    }
+    mp_int_t x = 0, y = 0, width = 0, height = 0;
+
+    if (n_args == 2 || n_args == 6) {
+        if (n_args == 6) {
+            x = mp_obj_get_int(args[2]);
+            y = mp_obj_get_int(args[3]);
+            width = mp_obj_get_int(args[4]);
+            height = mp_obj_get_int(args[5]);
+        }
+
+        self->work = (void *)m_malloc(3100);          // Pointer to the work area
+
+        JRESULT res;          // Result code of TJpgDec API
+        JDEC jdec;            // Decompression object
+        size_t bufsize = 0;
+
+        if (input_func && (devid.fp || devid.data)) {
+            // Prepare to decompress
+            res = jd_prepare(&jdec, input_func, self->work, 3100, &devid);
+            if (res == JDR_OK) {
+                if (n_args < 6) {
+                    x = 0;
+                    y = 0;
+                    width = jdec.width;
+                    height = jdec.height;
+                }
+                // Initialize output device
+                devid.left = x;
+                devid.top = y;
+                devid.right = x + width - 1;
+                devid.bottom = y + height - 1;
+
+                bufsize = 2 * width * height;
+                self->frame_buffer = m_malloc(bufsize);
+                if (self->frame_buffer) {
+                    memset(self->frame_buffer, 0xBEEF, bufsize);
+                } else {
+                    mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("out of memory"));
+                }
+
+                devid.fbuf = (uint8_t *)self->frame_buffer;
+                devid.wfbuf = jdec.width;
+                devid.self = self;
+                res = jd_decomp(&jdec, out_crop, 0);    // Start to decompress with 1/1 scaling
+                if (res != JDR_OK) {
+                    mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("jpg decompress failed."));
+                }
+
+            } else {
+                mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("jpg prepare failed."));
+            }
+            if (self->fp) {
+                mp_close(self->fp);
+                self->fp = MP_OBJ_NULL;
+            }
+        }
+        m_free(self->work);     // Discard work area
+
+        mp_obj_t result[3] = {
+            mp_obj_new_bytearray(bufsize, (mp_obj_t *)self->frame_buffer),
+            mp_obj_new_int(width),
+            mp_obj_new_int(height)
+        };
+
+        return mp_obj_new_tuple(3, result);
+    }
+
+    mp_raise_TypeError(MP_ERROR_TEXT("jpg_decode requires either 2 or 6 arguments"));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(rm67162_RM67162_jpg_decode_obj, 2, 6, rm67162_RM67162_jpg_decode);
+
+
+
+
 /*---------------------------------------------------------------------------------------------------
 Below are screencontroler related functions
 ----------------------------------------------------------------------------------------------------*/
@@ -1789,6 +2098,8 @@ STATIC const mp_rom_map_elem_t rm67162_RM67162_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_circle),          MP_ROM_PTR(&rm67162_RM67162_circle_obj)          },
     { MP_ROM_QSTR(MP_QSTR_colorRGB),        MP_ROM_PTR(&rm67162_RM67162_colorRGB_obj)        },
     { MP_ROM_QSTR(MP_QSTR_bitmap),          MP_ROM_PTR(&rm67162_RM67162_bitmap_obj)          },
+	{ MP_ROM_QSTR(MP_QSTR_jpg),             MP_ROM_PTR(&rm67162_RM67162_jpg_obj)             },
+     {MP_ROM_QSTR(MP_QSTR_jpg_decode),      MP_ROM_PTR(&rm67162_RM67162_jpg_decode_obj)      },
     { MP_ROM_QSTR(MP_QSTR_text),            MP_ROM_PTR(&rm67162_RM67162_text_obj)            },
     { MP_ROM_QSTR(MP_QSTR_mirror),          MP_ROM_PTR(&rm67162_RM67162_mirror_obj)          },
     { MP_ROM_QSTR(MP_QSTR_swap_xy),         MP_ROM_PTR(&rm67162_RM67162_swap_xy_obj)         },

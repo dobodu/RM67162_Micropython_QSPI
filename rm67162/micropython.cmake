@@ -6,8 +6,8 @@ add_library(usermod_rm67162 INTERFACE)
 target_sources(usermod_rm67162 INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/rm67162.c
     ${CMAKE_CURRENT_LIST_DIR}/t3amoled_qspi_bus.c
-    # ${CMAKE_CURRENT_LIST_DIR}/mpfile.c
-    # ${CMAKE_CURRENT_LIST_DIR}/jpg/tjpgd565.c
+    ${CMAKE_CURRENT_LIST_DIR}/mpfile/mpfile.c
+    ${CMAKE_CURRENT_LIST_DIR}/jpg/tjpgd565.c
     # ${CMAKE_CURRENT_LIST_DIR}/png/pngle.c
     # ${CMAKE_CURRENT_LIST_DIR}/png/miniz.c
     )
