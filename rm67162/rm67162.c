@@ -44,11 +44,24 @@ STATIC const rm67162_rotation_t ORIENTATIONS_GENERAL[4] = {
     { 0xA0, 0, 0, 0, 0}
 };
 
+
+/*Lilygo T-Display S3 Amoled orientations*/
+
 STATIC const rm67162_rotation_t ORIENTATIONS_240x536[4] = {
     { 0x00, 240, 536, 0, 0 },
     { 0x60, 536, 240, 0, 0 },
     { 0xC0, 240, 536, 0, 0 },
     { 0xA0, 536, 240, 0, 0 }
+};
+
+
+/*Lilygo T-Display S3 Amoled orientations*/
+
+STATIC const rm67162_rotation_t ORIENTATIONS_450x600[4] = {
+    { 0x00, 450, 600, 0, 0 },
+    { 0x60, 600, 450, 0, 0 },
+    { 0xC0, 450, 600, 0, 0 },
+    { 0xA0, 600, 450, 0, 0 }
 };
 
 int mod(int x, int m) {
