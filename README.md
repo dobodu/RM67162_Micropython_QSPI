@@ -1,3 +1,6 @@
+
+VERSION DEPRECIATED PLEASE HAVE A LOOK AT [Lilygo-Amoled-Micropython](https://github.com/dobodu/Lilygo-Amoled-Micropython)
+
 RM67162 Driver for MicroPython
 ------------------------------
 
